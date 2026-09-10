@@ -13,10 +13,9 @@ ADMINS = [8295783400]
 bot = Bot(token=TOKEN, parse_mode=types.ParseMode.HTML)
 dp = Dispatcher(bot, storage=MemoryStorage())
 
-# Bir nechta kanal va kinolarni saqlash ro'yxati
 CHANNELS = []        # [{"id": chat_id, "title": title, "link": link}]
 MOVIES = {}          # {"code": {"file_id": id, "caption": text}}
-REQUESTED_USERS = set()  # (user_id, chat_id) ko'rinishida zayavkalarni saqlaydi
+CLICKED_CHANNELS = {} # {user_id: set(channel_index)}
 
 class AddChannelState(StatesGroup):
     waiting_for_channel = State()
@@ -26,28 +25,45 @@ class AddMovieState(StatesGroup):
     waiting_for_video = State()
 
 
-# --- CHAT JOIN REQUEST HANDLER (Zayavkalarni ushlash) ---
+# --- CHAT JOIN REQUEST HANDLER ---
 @dp.chat_join_request_handler()
 async def process_join_request(update: types.ChatJoinRequest):
-    # Foydalanuvchi va kanal ID'sini xotiraga saqlaymiz
-    REQUESTED_USERS.add((update.from_user.id, update.chat.id))
+    user_id = update.from_user.id
+    if user_id not in CLICKED_CHANNELS:
+        CLICKED_CHANNELS[user_id] = set()
+    
+    # Barcha kanallar indeksi bo'yicha belgilaymiz
+    for idx, ch in enumerate(CHANNELS):
+        if ch['id'] == update.chat.id:
+            CLICKED_CHANNELS[user_id].add(idx)
+
     try:
         await bot.send_message(
-            chat_id=update.from_user.id,
-            text=f"<b>'{update.chat.title}'</b> kanaliga zayavka yuborildi!\nEndi botda <b>'✅ Tekshirish'</b> tugmasini bosing."
+            chat_id=user_id,
+            text=f"<b>'{update.chat.title}'</b> kanaliga zayavka qabul qilindi!\nEndi botga o'tib <b>'✅ Tekshirish'</b> tugmasini bosing."
         )
     except Exception as e:
         logging.error(f"Xabar yuborishda xatolik: {e}")
 
 
-# --- ZAYAVKANI TEKSHIRISH FUNKSIYASI ---
-def has_user_requested_all(user_id: int) -> list:
-    """Foydalanuvchi zayavka yubormagan kanallar ro'yxatini qaytaradi"""
-    unrequested = []
-    for ch in CHANNELS:
-        if (user_id, ch['id']) not in REQUESTED_USERS:
-            unrequested.append(ch)
-    return unrequested
+# --- KANAL TUGMASINI BOSGANDA (CALLBACK) ---
+@dp.callback_query_handler(lambda c: c.data.startswith("join_"))
+async def track_channel_click(call: types.CallbackQuery):
+    user_id = call.from_user.id
+    ch_index = int(call.data.split("_")[1])
+
+    if user_id not in CLICKED_CHANNELS:
+        CLICKED_CHANNELS[user_id] = set()
+
+    CLICKED_CHANNELS[user_id].add(ch_index)
+    
+    # Kanal havolasini olish va yo'naltirish
+    if ch_index < len(CHANNELS):
+        link = CHANNELS[ch_index]['link']
+        await call.answer("Kanalga o'tilmoqda... Zayavka yuborib qayting!", show_alert=False)
+        await call.message.answer(f"🔗 <a href='{link}'>Kanalga kirish va zayavka yuborish uchun bosing</a>")
+    else:
+        await call.answer("Kanal topilmadi.")
 
 
 # --- START HANDLER ---
@@ -55,17 +71,19 @@ def has_user_requested_all(user_id: int) -> list:
 async def start_handler(message: types.Message):
     user_id = message.from_user.id
 
-    # Zayavka yuborilmagan kanallarni aniqlaymiz
-    unrequested = has_user_requested_all(user_id)
+    user_clicks = CLICKED_CHANNELS.get(user_id, set())
+    unvisited = [ch for idx, ch in enumerate(CHANNELS) if idx not in user_clicks]
 
-    if unrequested:
+    if unvisited and CHANNELS:
         keyboard = types.InlineKeyboardMarkup(row_width=1)
-        for ch in unrequested:
-            keyboard.add(types.InlineKeyboardButton(text=f"➕ {ch['title']}", url=ch['link']))
+        for idx, ch in enumerate(CHANNELS):
+            if idx not in user_clicks:
+                keyboard.add(types.InlineKeyboardButton(text=f"➕ {ch['title']}", callback_data=f"join_{idx}"))
+        
         keyboard.add(types.InlineKeyboardButton(text="✅ Tekshirish", callback_data="check_subscription"))
 
         await message.answer(
-            "<b>Botdan foydalanish uchun quyidagi barcha kanallarga qo'shilish so'rovini (zayavka) yuboring:</b>",
+            "<b>Botdan foydalanish uchun quyidagi kanallarga kirib qo'shilish so'rovini (zayavka) yuboring:</b>",
             reply_markup=keyboard
         )
     else:
@@ -76,16 +94,17 @@ async def start_handler(message: types.Message):
 @dp.callback_query_handler(text="check_subscription")
 async def check_callback(call: types.CallbackQuery):
     user_id = call.from_user.id
-    unrequested = has_user_requested_all(user_id)
+    user_clicks = CLICKED_CHANNELS.get(user_id, set())
 
-    if unrequested:
-        await call.answer("Barcha kanallarga zayavka yubormadingiz!", show_alert=True)
+    # Barcha kanallarga bosilganini tekshiramiz
+    if len(user_clicks) < len(CHANNELS):
+        await call.answer("Barcha kanallarga zayavka yubormadingiz! Har bir kanal tugmasini bosing.", show_alert=True)
     else:
         await call.message.delete()
-        await call.message.answer("<b>Rahmat! Zayavkalaringiz qabul qilindi. Kino kodini yuboring:</b>")
+        await call.message.answer("<b>Rahmat! Zayavkalaringiz tasdiqlandi. Kino kodini yuboring:</b>")
 
 
-# --- ADMIN PANEL: BIR NECHTA KANAL QO'SHISH ---
+# --- ADMIN PANEL ---
 @dp.message_handler(commands=['addchannel'])
 async def add_channel_start(message: types.Message):
     if message.from_user.id not in ADMINS:
@@ -99,14 +118,12 @@ async def process_channel_forward(message: types.Message, state: FSMContext):
     if message.forward_from_chat:
         chat = message.forward_from_chat
         
-        # Kanal allaqachon qo'shilganligini tekshirish
         if any(c['id'] == chat.id for c in CHANNELS):
-            await message.answer("⚠️ Bu kanal allaqachon ro'yxatga qo'shilgan!")
+            await message.answer("⚠️ Bu kanal allaqachon qo'shilgan!")
             await state.finish()
             return
 
         try:
-            # Zayavkali maxsus link yaratamiz
             invite_link = await bot.create_chat_invite_link(
                 chat_id=chat.id,
                 creates_join_request=True
@@ -119,17 +136,16 @@ async def process_channel_forward(message: types.Message, state: FSMContext):
             await message.answer(
                 f"✅ <b>Kanal qo'shildi!</b>\n\n"
                 f"<b>Kanal:</b> {chat.title}\n"
-                f"<b>Jami qo'shilgan kanallar soni:</b> {len(CHANNELS)} ta\n\n"
-                f"<i>Yana kanal qo'shish uchun qaytadan /addchannel buyrug'ini yuboring.</i>"
+                f"<b>Jami kanallar:</b> {len(CHANNELS)} ta"
             )
         except Exception as e:
-            await message.answer(f"❌ Xatolik! Bot kanalda admin va link yaratish (Invite Users) huquqi borligini tekshiring.\n\nLog: {e}")
+            await message.answer(f"❌ Xatolik! Bot kanalda admin ekanligini tekshiring.\n\nLog: {e}")
     else:
         await message.answer("Iltimos, kanal xabarini FORWARD qilib yuboring.")
     await state.finish()
 
 
-# --- KINO QO'SHISH VA QIDIRISH ---
+# --- KINO BAZA ---
 @dp.message_handler(commands=['add'])
 async def add_movie_start(message: types.Message):
     if message.from_user.id not in ADMINS:
