@@ -1,5 +1,4 @@
 import os
-import re
 import logging
 from aiogram import Bot, Dispatcher, executor, types
 from aiogram.contrib.fsm_storage.memory import MemoryStorage
@@ -9,17 +8,17 @@ from aiogram.dispatcher.filters.state import State, StatesGroup
 # Logging sozlamalari
 logging.basicConfig(level=logging.INFO)
 
-# TELEGRAM BOT TOKEN
+# TELEGRAM BOT TOKEN VA ADMINLAR
 TOKEN = os.getenv("BOT_TOKEN", "8884134047:AAH9VLUItQukSswthtHpuC65IEiWNlterwc")
+ADMINS = [8295783400]  # O'zingizning Telegram ID'ingiz
 
 bot = Bot(token=TOKEN, parse_mode=types.ParseMode.HTML)
 dp = Dispatcher(bot, storage=MemoryStorage())
 
 # Vaqtinchalik ma'lumotlar bazasi (Xotirada)
-# Asosiy ishda ma'lumotlar bazasi (SQLite, DB va h.k.) ishlatiladi
-CHANNELS = []  # [{ "id": chat_id, "title": title, "link": link }]
-MOVIES = {}    # { "code": { "file_id": id, "caption": text } }
-ADMINS = [8295783400]    # Admin ID lari
+CHANNELS = []       # [{"id": chat_id, "title": title, "link": link}]
+MOVIES = {}         # {"code": {"file_id": id, "caption": text}}
+PENDING_USERS = set() # Zayavka tashlagan foydalanuvchilar ID'si
 
 class AddChannelState(StatesGroup):
     waiting_for_channel = State()
@@ -29,20 +28,35 @@ class AddMovieState(StatesGroup):
     waiting_for_video = State()
 
 
-# --- START VA HELP HANDLERLARI ---
+# --- CHAT JOIN REQUEST HANDLER (Zayavkalarni ushlab qolish) ---
+@dp.chat_join_request_handler()
+async def process_join_request(update: types.ChatJoinRequest):
+    # Foydalanuvchi zayavka tashlaganda uni ro'yxatga olamiz
+    PENDING_USERS.add(update.from_user.id)
+    try:
+        await bot.send_message(
+            chat_id=update.from_user.id,
+            text="<b>Arizangiz qabul qilindi!</b>\nEndi botdan bemalol foydalanishingiz mumkin."
+        )
+    except Exception as e:
+        logging.error(f"Foydalanuvchiga xabar yuborishda xatolik: {e}")
 
+
+# --- START HANDLER ---
 @dp.message_handler(commands=['start'])
 async def start_handler(message: types.Message):
-    # Adminlarni birinchi start bosganda ro'yxatga olish (misol uchun)
-    if message.from_user.id not in ADMINS and len(ADMINS) == 0:
-        ADMINS.append(message.from_user.id)
+    user_id = message.from_user.id
 
-    # Majburiy obunani tekshirish
+    if user_id not in ADMINS and len(ADMINS) == 0:
+        ADMINS.append(user_id)
+
+    # Obunani va Zayavkalarni tekshirish
     unsubscribed = []
     for ch in CHANNELS:
         try:
-            member = await bot.get_chat_member(chat_id=ch['id'], user_id=message.from_user.id)
-            if member.status in ['left', 'kicked']:
+            member = await bot.get_chat_member(chat_id=ch['id'], user_id=user_id)
+            # Agar foydalanuvchi kanalda bo'lmasa va zayavka ham topshirmagan bo'lsa
+            if member.status in ['left', 'kicked'] and user_id not in PENDING_USERS:
                 unsubscribed.append(ch)
         except Exception as e:
             logging.error(f"Kanalni tekshirishda xatolik: {e}")
@@ -50,165 +64,86 @@ async def start_handler(message: types.Message):
     if unsubscribed:
         keyboard = types.InlineKeyboardMarkup(row_width=1)
         for ch in unsubscribed:
-            url = ch.get('link') or "https://t.me"
-            keyboard.add(types.InlineKeyboardButton(text=f"➕ {ch['title']}", url=url))
+            keyboard.add(types.InlineKeyboardButton(text=f"➕ {ch['title']}", url=ch['link']))
         keyboard.add(types.InlineKeyboardButton(text="✅ Tekshirish", callback_data="check_subscription"))
-        
+
         await message.answer(
-            "<b>Botdan foydalanish uchun quyidagi kanallarga obuna bo'ling va Zayavka yuboring:</b>",
+            "<b>Botdan foydalanish uchun quyidagi kanallarga qo'shilish so'rovini (zayavka) yuboring:</b>",
             reply_markup=keyboard
         )
-        return
+    else:
+        await message.answer("<b>Xush kelibsiz! Kino kodini yuboring:</b>")
 
-    await message.answer("<b>Xush kelibsiz!</b> Kinoni ko'rish uchun kino kodini yuboring.")
 
-
+# --- TEKSHIRISH BUTTON CALLBACK ---
 @dp.callback_query_handler(text="check_subscription")
-async def check_sub_callback(call: types.CallbackQuery):
+async def check_callback(call: types.CallbackQuery):
+    user_id = call.from_user.id
     unsubscribed = []
+
     for ch in CHANNELS:
         try:
-            member = await bot.get_chat_member(chat_id=ch['id'], user_id=call.from_user.id)
-            if member.status in ['left', 'kicked']:
+            member = await bot.get_chat_member(chat_id=ch['id'], user_id=user_id)
+            if member.status in ['left', 'kicked'] and user_id not in PENDING_USERS:
                 unsubscribed.append(ch)
-        except Exception:
-            pass
+        except Exception as e:
+            logging.error(f"Tekshirishda xatolik: {e}")
 
     if unsubscribed:
-        await call.answer("⚠️ Hali barcha kanallarga obuna bo'lmadingiz!", show_alert=True)
+        await call.answer("Barcha kanallarga zayavka yubormadingiz!", show_alert=True)
     else:
         await call.message.delete()
-        await call.message.answer("✅ Rahmat! Endi kino kodini yuborishingiz mumkin.")
+        await call.message.answer("<b>Rahmat! Obuna/Zayavka tekshirildi. Kino kodini yuboring:</b>")
 
 
-# --- KANAL QO'SHISH VA BOSHQARISH ---
-
+# --- ADMIN PANEL & KANAL QO'SHISH ---
 @dp.message_handler(commands=['addchannel'])
-async def cmd_add_channel(message: types.Message):
+async def add_channel_start(message: types.Message):
     if message.from_user.id not in ADMINS:
         return
-    
-    await message.answer(
-        "<b>Kanal ulash uchun:</b>\n\n"
-        "1. Botni kanalga <b>Admin</b> qiling (Taklif havolalari yaratish huquqini bering).\n"
-        "2. Kanalning <code>@username</code>ini, <code>https://t.me/...</code> linkini yoki <b>kanaldan biror xabarni ushbu botga FORWARD qilib yuboring</b>."
-    )
     await AddChannelState.waiting_for_channel.set()
-
+    await message.answer("Kanalni qo'shish uchun kanaldan biror xabarni botga <b>FORWARD</b> qilib yuboring.")
 
 @dp.message_handler(state=AddChannelState.waiting_for_channel, content_types=types.ContentTypes.ANY)
-async def process_add_channel(message: types.Message, state: FSMContext):
-    chat_id = None
-    custom_link = None
-
-    # 1. Agar kanaldan Forward qilingan xabar bo'lsa (Zayavkali/Private kanallar uchun eng ma'quli)
+async def process_channel_forward(message: types.Message, state: FSMContext):
     if message.forward_from_chat:
-        chat_id = message.forward_from_chat.id
-
-    # 2. Agar matn ko'rinishida yuborilgan bo'lsa
-    elif message.text:
-        text = message.text.strip()
-        if "t.me/" in text:
-            username_match = re.search(r"t\.me/([a-zA-Z0-9_]+)", text)
-            if username_match:
-                chat_id = f"@{username_match.group(1)}"
-            else:
-                custom_link = text
-        elif text.startswith("@"):
-            chat_id = text
-        elif text.startswith("-100") and text[1:].isdigit():
-            chat_id = int(text)
-
-    if not chat_id:
-        await message.answer("❌ Kanal aniqlanmadi. Iltimos, kanaldan biror xabarni FORWARD qilib yuboring yoki @username / link yuboring.")
-        return
-
-    try:
-        chat_info = await bot.get_chat(chat_id)
-        bot_member = await bot.get_chat_member(chat_info.id, bot.id)
-        
-        if bot_member.status not in ["administrator", "creator"]:
-            await message.answer("⚠️ Bot ushbu kanalda ADMIN emas! Avval botga adminlik huquqini bering.")
-            await state.finish()
-            return
-
-        # Kanal invite linkini olish
-        invite_link = custom_link or chat_info.invite_link
-        if not invite_link:
-            try:
-                invite_link = await bot.export_chat_invite_link(chat_info.id)
-            except Exception:
-                invite_link = f"https://t.me/{chat_info.username}" if chat_info.username else None
-
-        # Kanalni ro'yxatga saqlash
-        channel_data = {
-            "id": chat_info.id,
-            "title": chat_info.title,
-            "link": invite_link
-        }
-        
-        # Takrorlanmaslikni tekshirish
-        CHANNELS[:] = [c for c in CHANNELS if c['id'] != chat_info.id]
-        CHANNELS.append(channel_data)
-
-        await message.answer(f"✅ <b>{chat_info.title}</b> kanali muvaffaqiyatli ulandi!\nLink: {invite_link}")
-        await state.finish()
-
-    except Exception as e:
-        await message.answer(f"❌ Xatolik yuz berdi: {e}")
-        await state.finish()
+        chat = message.forward_from_chat
+        try:
+            # Zayavkali maxsus link yaratamiz (creates_join_request=True)
+            invite_link = await bot.create_chat_invite_link(
+                chat_id=chat.id,
+                creates_join_request=True
+            )
+            
+            CHANNELS.append({
+                "id": chat.id,
+                "title": chat.title,
+                "link": invite_link.invite_link
+            })
+            
+            await message.answer(f"✅ <b>Kanal muvaffaqiyatli qo'shildi!</b>\n\n<b>Kanal:</b> {chat.title}\n<b>Zayavka havolasi:</b> {invite_link.invite_link}")
+        except Exception as e:
+            await message.answer(f"❌ Xatolik! Botni kanalda admin qilganingizga va link yaratish huquqi borligiga ishonch hosil qiling.\n\nLog: {e}")
+    else:
+        await message.answer("Iltimos, kanal xabarini <b>FORWARD</b> (qayta yo'naltirib) qilib yuboring.")
+    await state.finish()
 
 
-@dp.message_handler(commands=['channels'])
-async def list_channels(message: types.Message):
-    if message.from_user.id not in ADMINS:
-        return
-    if not CHANNELS:
-        await message.answer("Hozircha ulangan kanallar yo'q.")
-        return
-
-    text = "<b>Ulangan kanallar ro'yxati:</b>\n\n"
-    for idx, ch in enumerate(CHANNELS, 1):
-        text += f"{idx}. {ch['title']} (ID: <code>{ch['id']}</code>)\n"
-    await message.answer(text)
-
-
-# --- ZAYAVKALARNI AVTOMATIK QABUL QILISH (JOIN REQUEST) ---
-
-@dp.chat_join_request_handler()
-async def auto_approve_join_request(update: types.ChatJoinRequest):
-    try:
-        # Zayapkani avtomatik tasdiqlash
-        await update.approve()
-        
-        # Foydalanuvchiga xabar yuborish
-        await bot.send_message(
-            chat_id=update.from_user.id,
-            text="✅ Sizning kanaldagi zayavkangiz qabul qilindi! Endi botdan kinolarni tomosha qilishingiz mumkin."
-        )
-    except Exception as e:
-        logging.error(f"Zayavka qabul qilishda xatolik: {e}")
-
-
-# --- KINO YUKLASH VA QIDIRISH ---
-
+# --- KINO QO'SHISH VA QIDIRISH ---
 @dp.message_handler(commands=['add'])
 async def add_movie_start(message: types.Message):
     if message.from_user.id not in ADMINS:
         return
-    await message.answer("Kino uchun kod kiriting (Masalan: 101):")
     await AddMovieState.waiting_for_code.set()
-
+    await message.answer("Kino uchun kod kiriting (Masalan: 101):")
 
 @dp.message_handler(state=AddMovieState.waiting_for_code)
 async def process_movie_code(message: types.Message, state: FSMContext):
-    code = message.text.strip()
-    await state.update_data(code=code)
-    await message.answer(f"<b>{code}</b> kodi uchun kino videosini yuboring:")
+    await state.update_data(code=message.text.strip())
     await AddMovieState.waiting_for_video.set()
+    await message.answer("Endi kinoni (video faylini) yuboring:")
 
-
-@dp.message_handler(content_types=types.ContentTypes.VIDEO, state=AddMovieState.waiting_for_video)
+@dp.message_handler(state=AddMovieState.waiting_for_video, content_types=types.ContentType.VIDEO)
 async def process_movie_video(message: types.Message, state: FSMContext):
     data = await state.get_data()
     code = data['code']
@@ -217,32 +152,17 @@ async def process_movie_video(message: types.Message, state: FSMContext):
         "file_id": message.video.file_id,
         "caption": message.caption or ""
     }
-    
-    await message.answer(f"✅ Kino saqlandi! Kod: <b>{code}</b>")
+    await message.answer(f"✅ Kino saqlandi! Kodu: <b>{code}</b>")
     await state.finish()
 
-
-@dp.message_handler(commands=['stat'])
-async def show_stats(message: types.Message):
-    if message.from_user.id not in ADMINS:
-        return
-    await message.answer(f"📊 <b>Statistika:</b>\n\nUlangan kanallar: {len(CHANNELS)} ta\nYuklangan kinolar: {len(MOVIES)} ta")
-
-
-# --- KINO KODINI QABUL QILISH ---
-
 @dp.message_handler()
-async def get_movie_by_code(message: types.Message):
+async def search_movie(message: types.Message):
     code = message.text.strip()
-    
     if code in MOVIES:
         movie = MOVIES[code]
-        await message.answer_video(
-            video=movie['file_id'],
-            caption=movie['caption']
-        )
+        await message.answer_video(video=movie['file_id'], caption=movie['caption'])
     else:
-        await message.answer("❌ Bunday kodli kino topilmadi. Kodni to'g'ri kiritganingizni tekshiring.")
+        await message.answer("Bunday kodli kino topilmadi.")
 
 
 if __name__ == '__main__':
