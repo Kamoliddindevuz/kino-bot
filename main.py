@@ -10,7 +10,7 @@ from aiogram.dispatcher.filters.state import State, StatesGroup
 logging.basicConfig(level=logging.INFO)
 
 # TELEGRAM BOT TOKEN
-TOKEN = os.getenv("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
+TOKEN = os.getenv("BOT_TOKEN", "8884134047:AAH9VLUItQukSswthtHpuC65IEiWNlterwc")
 
 bot = Bot(token=TOKEN, parse_mode=types.ParseMode.HTML)
 dp = Dispatcher(bot, storage=MemoryStorage())
@@ -19,7 +19,7 @@ dp = Dispatcher(bot, storage=MemoryStorage())
 # Asosiy ishda ma'lumotlar bazasi (SQLite, DB va h.k.) ishlatiladi
 CHANNELS = []  # [{ "id": chat_id, "title": title, "link": link }]
 MOVIES = {}    # { "code": { "file_id": id, "caption": text } }
-ADMINS = []    # Admin ID lari
+ADMINS = [8295783400]    # Admin ID lari
 
 class AddChannelState(StatesGroup):
     waiting_for_channel = State()
